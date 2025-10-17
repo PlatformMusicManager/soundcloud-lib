@@ -1,13 +1,11 @@
-use std::error::Error;
+use async_stream::stream;
+use futures::{Stream, StreamExt, TryStreamExt};
+use regex::Regex;
+use reqwest::{Client, Url};
+use serde::{Deserialize, Serialize};
 use std::io::ErrorKind;
 use std::pin::Pin;
 use std::sync::Arc;
-use async_stream::stream;
-use axum::http::StatusCode;
-use reqwest::{Client, Url};
-use serde::{Deserialize, Serialize};
-use regex::Regex;
-use futures::{Stream, StreamExt, TryStreamExt};
 use thiserror::Error;
 
 const BASE_URL: &str = "https://api-v2.soundcloud.com";
@@ -15,7 +13,7 @@ const BASE_URL: &str = "https://api-v2.soundcloud.com";
 #[derive(Deserialize, Serialize, Clone)]
 pub struct FormatData {
     pub protocol: String,
-    pub mime_type: String
+    pub mime_type: String,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -49,24 +47,24 @@ pub struct TrackData {
     pub duration: i32,
     pub media: Media,
     pub track_authorization: String,
-    pub user: User
+    pub user: User,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
 #[serde(untagged)] // Try to deserialize as one of the variants
 pub enum PlaylistTrack {
-    Full(TrackData), // Your original (but now fully optional) TrackData
-    Partial { id: i32}, // A struct for the minimal objects
+    Full(TrackData),     // Your original (but now fully optional) TrackData
+    Partial { id: i32 }, // A struct for the minimal objects
 }
 
 #[derive(Deserialize, Serialize, Clone)]
 pub struct PlaylistData {
     pub id: i32,
     pub title: String,
-    pub artwork_url:  Option<String>,
+    pub artwork_url: Option<String>,
     pub duration: i32,
     pub user: User,
-    pub tracks: Vec<PlaylistTrack>
+    pub tracks: Vec<PlaylistTrack>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -78,9 +76,8 @@ pub enum SearchItem {
 
 #[derive(Deserialize, Serialize)]
 pub struct SearchResponse {
-    pub collection: Vec<SearchItem>
+    pub collection: Vec<SearchItem>,
 }
-
 
 #[derive(Deserialize, Serialize)]
 pub struct ChunkUrl {
@@ -118,15 +115,25 @@ impl SoundCloudApi {
         Self {
             client: Client::new(),
             client_id,
-            url_re: Regex::new(r#"https:?:[^\s"]+"#).unwrap()
+            url_re: Regex::new(r#"https:?:[^\s"]+"#).unwrap(),
         }
     }
 
-    pub async fn search(&self, query: &str, offset: &str, limit: &str) -> Result<SearchResponse, SoundcloudError> {
-        let url = Url::parse_with_params(format!("{}/search", BASE_URL).as_str(), &[
-            ("q", query), ("client_id", self.client_id.as_str()),
-            ("limit", limit), ("offset", offset)
-        ])?;
+    pub async fn search(
+        &self,
+        query: &str,
+        offset: &str,
+        limit: &str,
+    ) -> Result<SearchResponse, SoundcloudError> {
+        let url = Url::parse_with_params(
+            format!("{}/search", BASE_URL).as_str(),
+            &[
+                ("q", query),
+                ("client_id", self.client_id.as_str()),
+                ("limit", limit),
+                ("offset", offset),
+            ],
+        )?;
 
         let req = self.client.get(url).build()?;
         let res = self.client.execute(req).await?.text().await?;
@@ -136,9 +143,10 @@ impl SoundCloudApi {
     }
 
     pub async fn get_track_data(&self, ids: &str) -> Result<Vec<TrackData>, SoundcloudError> {
-        let url = Url::parse_with_params(format!("{BASE_URL}/tracks").as_str(), &[
-            ("ids", ids), ("client_id", self.client_id.as_str()),
-        ])?;
+        let url = Url::parse_with_params(
+            format!("{BASE_URL}/tracks").as_str(),
+            &[("ids", ids), ("client_id", self.client_id.as_str())],
+        )?;
         let req = self.client.get(url).build()?;
         let res = self.client.execute(req).await?.text().await?;
         let track: Vec<TrackData> = serde_json::from_str(&res)?;
@@ -146,10 +154,18 @@ impl SoundCloudApi {
         Ok(track)
     }
 
-    pub async fn get_url_to_chunks(&self, url: &str, track_authorization: &str) -> Result<String, SoundcloudError> {
-        let url = Url::parse_with_params(url, &[
-            ("client_id", self.client_id.as_str()), ("track_authorization", track_authorization),
-        ])?;
+    pub async fn get_url_to_chunks(
+        &self,
+        url: &str,
+        track_authorization: &str,
+    ) -> Result<String, SoundcloudError> {
+        let url = Url::parse_with_params(
+            url,
+            &[
+                ("client_id", self.client_id.as_str()),
+                ("track_authorization", track_authorization),
+            ],
+        )?;
         let req = self.client.get(url).build()?;
         let res = self.client.execute(req).await?.text().await?;
         let urls: ChunkUrl = serde_json::from_str(&res)?;
@@ -160,17 +176,17 @@ impl SoundCloudApi {
     pub async fn get_chunks(&self, url: &str) -> Result<Vec<String>, SoundcloudError> {
         let req = self.client.get(url).build()?;
         let res = self.client.execute(req).await?.text().await?;
-        let urls: Vec<String> = self.url_re.find_iter(res.as_str()).map(|m| m.as_str().to_string()).collect();
+        let urls: Vec<String> = self
+            .url_re
+            .find_iter(res.as_str())
+            .map(|m| m.as_str().to_string())
+            .collect();
 
         Ok(urls)
     }
 
     pub async fn stream_chunk(&self, url: String) -> Result<ByteStream, SoundcloudError> {
-        let response = self.client
-            .get(url)
-            .send()
-            .await?;
-
+        let response = self.client.get(url).send().await?;
 
         let stream = response
             .bytes_stream()
@@ -181,14 +197,22 @@ impl SoundCloudApi {
     }
 
     pub async fn stream(self: Arc<Self>, id: &str) -> Result<ByteStream, SoundcloudError> {
-        let track_data = self
-            .get_track_data(id).await?;
+        let track_data = self.get_track_data(id).await?;
 
-        let track = track_data.first().ok_or_else(SoundcloudError::NoTrackDataInResponse)?;
+        let track = track_data
+            .first()
+            .ok_or_else(SoundcloudError::NoTrackDataInResponse)?;
 
-        let media_data = track.media.transcodings.first().ok_or_else(SoundcloudError::NoMediaDataInResponse)?;
+        // Picking first available audio, first one is always highest quality
+        let media_data = track
+            .media
+            .transcodings
+            .first()
+            .ok_or_else(SoundcloudError::NoMediaDataInResponse)?;
 
-        let url_with_chunks = self.get_url_to_chunks(&media_data.url, &track.track_authorization).await?;
+        let url_with_chunks = self
+            .get_url_to_chunks(&media_data.url, &track.track_authorization)
+            .await?;
 
         let url_chunks = self.get_chunks(&url_with_chunks).await?;
 
