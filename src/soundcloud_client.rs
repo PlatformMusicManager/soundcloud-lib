@@ -14,6 +14,7 @@ use crate::s3_client::new_s3_client;
 use log::{error, info, debug};
 use tokio_stream::wrappers::BroadcastStream;
 use crate::byte_stream::{BodyStreamError, BroadcastStreamBodyWrapper, ByteStream};
+use url::ParseError;
 
 const BASE_URL: &str = "https://api-v2.soundcloud.com";
 
@@ -105,7 +106,7 @@ pub enum SoundcloudError {
     InvalidRequestToSoundcloud(#[from] reqwest::Error),
 
     #[error("Error while creating URL for SoundCloud request, invalid data was provided")]
-    UrlParseError(#[from] url::ParseError),
+    UrlParseError(#[from] ParseError),
 
     #[error("Error while deserialize")]
     DeserializeError(#[from] serde_json::Error),

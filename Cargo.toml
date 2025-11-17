@@ -22,3 +22,4 @@ aws-config = "1.8.10"
 http-body = "1.0.1"
 tokio-stream = { version = "0.1", features = ["sync"] }
 log = "0.4.28"
+url = "2.5.7"
