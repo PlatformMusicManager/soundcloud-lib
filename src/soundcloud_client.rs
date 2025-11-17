@@ -1,12 +1,19 @@
 use async_stream::stream;
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt};
 use regex::Regex;
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
-use std::io::ErrorKind;
-use std::pin::Pin;
 use std::sync::Arc;
 use thiserror::Error;
+use aws_sdk_s3::Client as S3Client;
+use aws_sdk_s3::primitives::SdkBody;
+use bytes::Bytes;
+use tokio::sync::broadcast;
+use tokio::sync::broadcast::error::SendError;
+use crate::s3_client::new_s3_client;
+use log::{error, info, debug};
+use tokio_stream::wrappers::BroadcastStream;
+use crate::byte_stream::{BodyStreamError, BroadcastStreamBodyWrapper, ByteStream};
 
 const BASE_URL: &str = "https://api-v2.soundcloud.com";
 
@@ -80,14 +87,16 @@ pub struct SearchResponse {
 }
 
 #[derive(Deserialize, Serialize)]
-pub struct ChunkUrl {
+struct ChunkUrl {
     pub url: String,
 }
 
 pub struct SoundCloudApi {
+    s3_client: S3Client,
     client: Client,
     client_id: String,
     url_re: Regex,
+    bucket_name: String,
 }
 
 #[derive(Error, Debug)]
@@ -106,16 +115,25 @@ pub enum SoundcloudError {
 
     #[error("No media data attached in track in response")]
     NoMediaDataInResponse(),
+
+    #[error("Tx send error")]
+    TxSendError(#[from] SendError<Result<Bytes, BodyStreamError>>),
 }
 
-pub type ByteStream = Pin<Box<dyn Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>>;
-
 impl SoundCloudApi {
-    pub fn new(client_id: String) -> Self {
+    pub async fn new(
+        client_id: String,
+        url: &str,
+        access_key_id: impl Into<String>,
+        secret_access_key: impl Into<String>,
+        bucket_name: String
+    )-> Self {
         Self {
+            s3_client: new_s3_client(url, access_key_id, secret_access_key, vec![&bucket_name]).await,
             client: Client::new(),
             client_id,
             url_re: Regex::new(r#"https:?:[^\s"]+"#).unwrap(),
+            bucket_name
         }
     }
 
@@ -185,18 +203,7 @@ impl SoundCloudApi {
         Ok(urls)
     }
 
-    pub async fn stream_chunk(&self, url: String) -> Result<ByteStream, SoundcloudError> {
-        let response = self.client.get(url).send().await?;
-
-        let stream = response
-            .bytes_stream()
-            .map_err(|e| std::io::Error::new(ErrorKind::Other, e)) // A better mapping
-            .boxed();
-
-        Ok(stream)
-    }
-
-    pub async fn stream(self: Arc<Self>, id: &str) -> Result<ByteStream, SoundcloudError> {
+    pub async fn get_chunks_by_id(&self, id: &str) -> Result<Vec<String>, SoundcloudError> {
         let track_data = self.get_track_data(id).await?;
 
         let track = track_data
@@ -216,11 +223,29 @@ impl SoundCloudApi {
 
         let url_chunks = self.get_chunks(&url_with_chunks).await?;
 
+        Ok(url_chunks)
+    }
+
+    pub async fn stream_chunk(&self, url: String) -> Result<ByteStream, SoundcloudError> {
+        let response = self.client.get(url).send().await?;
+
+        let stream = response
+            .bytes_stream()
+            .map_err(|_e| BodyStreamError::SourceError) // A better mapping
+            .boxed();
+
+        Ok(stream)
+    }
+
+    pub async fn stream(self: Arc<Self>, id: &str) -> Result<ByteStream, SoundcloudError> {
+        let url_chunks = self.get_chunks_by_id(id).await?;
+
+        let self_clone = Arc::clone(&self);
         let stream = stream! {
             // Iterate through each of your chunk URLs
             for url_chunk in url_chunks.into_iter() {
                 // 1. Get the Result<ByteStream, ...> for this specific chunk
-                let sub_stream_result = self.stream_chunk(url_chunk).await;
+                let sub_stream_result = self_clone.stream_chunk(url_chunk).await;
 
                 match sub_stream_result {
                     // 2. If you successfully got a sub-stream of bytes...
@@ -233,9 +258,8 @@ impl SoundCloudApi {
                     }
                     // If getting the sub-stream failed, we need to yield an error
                     // that matches the outer stream's error type (std::io::Error).
-                    Err(e) => {
-                        let io_error = std::io::Error::new(ErrorKind::Other, e.to_string());
-                        yield Err(io_error);
+                    Err(_) => {
+                        yield Err(BodyStreamError::SourceError);
                         // After a fatal error, stop processing more chunks.
                         break;
                     }
@@ -244,5 +268,79 @@ impl SoundCloudApi {
         };
 
         Ok(stream.boxed())
+    }
+
+    pub async fn stream_and_save(
+        self: Arc<Self>,
+        id: String,
+    ) -> Result<BroadcastStreamBodyWrapper, SoundcloudError> {
+        // 1. Get chunk URLs
+        let url_chunks = self.get_chunks_by_id(&id).await?;
+
+        // 2. Create the broadcast channel
+        let (tx, _rx) = broadcast::channel(16);
+
+        // --- S3 Uploader Setup ---
+        let s3_rx = tx.subscribe();
+        let s3_stream = BroadcastStream::new(s3_rx);
+        let s3_body_wrapper = BroadcastStreamBodyWrapper::new(s3_stream);
+        let sdk_body = SdkBody::from_body_1_x(s3_body_wrapper); // Your specific conversion
+
+        let self_for_s3 = Arc::clone(&self);
+        let s3_id = id.clone(); // Clone id for the S3 task
+
+        // --- Task 1: The S3 Uploader ---
+        tokio::spawn(async move {
+            // REFINEMENT 1: Handle the Result instead of using .expect()
+            let result = self_for_s3.s3_client
+                .put_object()
+                .bucket(&self_for_s3.bucket_name)
+                .key(s3_id.clone())
+                .body(sdk_body.into())
+                .send()
+                .await;
+
+            if let Err(e) = result {
+                // Now you have a proper error log instead of a silent panic
+                error!("Failed to upload object with id: {} to S3. Error: {}", s3_id, e);
+            } else {
+                info!("Successfully uploaded object with id: {}", s3_id);
+            }
+        });
+
+        // --- Downloader Setup ---
+        let downloader_tx = tx.clone();
+        let self_for_downloader = Arc::clone(&self);
+
+        // --- Task 2: The Downloader ---
+        tokio::spawn(async move {
+            for url_chunk in url_chunks.into_iter() {
+                match self_for_downloader.stream_chunk(url_chunk).await {
+                    Ok(mut sub_stream) => {
+                        while let Some(bytes_result) = sub_stream.next().await {
+                            // REFINEMENT 3: Log when stopping
+                            if downloader_tx.send(bytes_result).is_err() {
+                                debug!("Stopping download for id: {}; all receivers are gone.", id);
+                                return; // Stop if no one is listening
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // REFINEMENT 2: Send the actual error
+                        error!("Failed to download chunk for id: {}. Error: {}", id, e);
+                        // Propagate a meaningful error into the channel
+                        let _ = downloader_tx.send(Err(BodyStreamError::ChunkError));
+                        return; // Stop the download process on a critical error
+                    }
+                }
+            }
+        });
+
+        // --- Return stream for the original caller ---
+        let caller_rx = tx.subscribe();
+        let caller_stream = BroadcastStream::new(caller_rx);
+        let caller_body_wrapper = BroadcastStreamBodyWrapper::new(caller_stream);
+
+        Ok(caller_body_wrapper)
     }
 }
