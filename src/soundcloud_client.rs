@@ -10,7 +10,6 @@ use aws_sdk_s3::primitives::SdkBody;
 use bytes::Bytes;
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::SendError;
-use crate::s3_client::new_s3_client;
 use log::{error, info, debug};
 use tokio_stream::wrappers::BroadcastStream;
 use crate::byte_stream::{BodyStreamError, BroadcastStreamBodyWrapper, ByteStream};
@@ -124,13 +123,11 @@ pub enum SoundcloudError {
 impl SoundCloudApi {
     pub async fn new(
         client_id: String,
-        url: &str,
-        access_key_id: impl Into<String>,
-        secret_access_key: impl Into<String>,
+        s3_client: S3Client,
         bucket_name: String
     )-> Self {
         Self {
-            s3_client: new_s3_client(url, access_key_id, secret_access_key, vec![&bucket_name]).await,
+            s3_client,
             client: Client::new(),
             client_id,
             url_re: Regex::new(r#"https:?:[^\s"]+"#).unwrap(),
