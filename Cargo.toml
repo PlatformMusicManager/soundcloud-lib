@@ -8,6 +8,8 @@ name = "soundcloud"
 path = "src/lib.rs"
 
 [dependencies]
+domain = { path = "../domain-lib" }
+
 reqwest = { version = "0.12.24", features = ["stream"] }
 serde = { version = "1.0.228", features = ["derive"] }
 regex = "1.12.2"
@@ -23,3 +25,5 @@ http-body = "1.0.1"
 tokio-stream = { version = "0.1", features = ["sync"] }
 log = "0.4.28"
 url = "2.5.7"
+const_format = "0.2.35"
+axum = "0.8.7"

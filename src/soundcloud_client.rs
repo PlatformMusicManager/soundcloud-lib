@@ -10,6 +10,7 @@ use aws_sdk_s3::Client as S3Client;
 use bytes::Bytes;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_sdk_s3::primitives::ByteStream as SdkByteStream;
+use axum::response::{IntoResponse, Response};
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::{SendError, RecvError};
 use log::{error, info, debug};
@@ -18,8 +19,11 @@ use crate::byte_stream::{BodyStreamError, BroadcastStreamBodyWrapper, ByteStream
 use url::ParseError;
 use crate::models::search::SearchResponse;
 use crate::models::track::TrackData;
+use const_format::formatcp;
+use domain::create_json_error_str;
+use crate::soundcloud_client::SoundcloudError::InvalidRequestToSoundcloud;
 
-const BASE_URL: &str = "https://api-v2.soundcloud.com";
+const BASE_URL: &'static str = "https://api-v2.soundcloud.com";
 
 #[derive(Deserialize, Serialize)]
 struct ChunkUrl {
@@ -56,6 +60,33 @@ pub enum SoundcloudError {
     TxSendError(#[from] SendError<Result<Bytes, BodyStreamError>>),
 }
 
+impl IntoResponse for SoundcloudError{
+    fn into_response(self) -> Response {
+        let res = match self {
+            InvalidRequestToSoundcloud(_) => {
+                create_json_error_str!("InvalidRequestToSoundcloud");
+            }
+            SoundcloudError::UrlParseError(_) => {
+                create_json_error_str!("Fail to parse URL with provided params");
+            }
+            SoundcloudError::DeserializeError(_) => {
+                create_json_error_str!("Deserialize soundcloud response error");
+            }
+            SoundcloudError::NoTrackDataInResponse() => {
+                create_json_error_str!("No track data in response");
+            }
+            SoundcloudError::NoMediaDataInResponse() => {
+                create_json_error_str!("No media data in response");
+            }
+            SoundcloudError::TxSendError(_) => {
+                create_json_error_str!("Tx send error");
+            }
+        };
+
+        res.into_response()
+    }
+}
+
 impl SoundCloudApi {
     pub async fn new(
         client_id: String,
@@ -80,10 +111,10 @@ impl SoundCloudApi {
         limit: &str,
     ) -> Result<SearchResponse, SoundcloudError> {
         let url = Url::parse_with_params(
-            concat!(BASE_URL, "/search"),
+            formatcp!("{}/search", BASE_URL),
             &[
                 ("q", query),
-                ("client_id", self.client_id.as_str()),
+                ("client_id", &self.client_id),
                 ("limit", limit),
                 ("offset", offset),
             ],
@@ -98,8 +129,8 @@ impl SoundCloudApi {
 
     pub async fn get_track_data(&self, ids: &str) -> Result<Vec<TrackData>, SoundcloudError> {
         let url = Url::parse_with_params(
-            concat!(BASE_URL, "/tracks"),
-            &[("ids", ids), ("client_id", self.client_id.as_str())],
+            formatcp!("{}/tracks", BASE_URL),
+            &[("ids", ids), ("client_id", &self.client_id)],
         )?;
         let req = self.client.get(url).build()?;
         let res = self.client.execute(req).await?.text().await?;
@@ -162,7 +193,7 @@ impl SoundCloudApi {
         Ok(url_chunks)
     }
 
-    pub async fn stream_chunk(&self, url: String) -> Result<ByteStream, SoundcloudError> {
+    async fn stream_chunk(&self, url: String) -> Result<ByteStream, SoundcloudError> {
         let response = self.client.get(url).send().await?;
 
         let stream = response
@@ -173,15 +204,29 @@ impl SoundCloudApi {
         Ok(stream)
     }
 
-    pub async fn stream(self: Arc<Self>, id: &str) -> Result<ByteStream, SoundcloudError> {
-        let url_chunks = self.get_chunks_by_id(id).await?;
+    pub async fn stream_by_id(self: Arc<Self>, id: String) -> Result<ByteStream, SoundcloudError> {
+        let url_chunks = self.get_chunks_by_id(&id).await?;
 
-        let self_clone = Arc::clone(&self);
+        self.stream_chunks(url_chunks).await
+    }
+
+    pub async fn stream_by_token(self: Arc<Self>, track_url: String, track_token: String) -> Result<ByteStream, SoundcloudError> {
+        let url_with_chunks = self
+            .get_url_to_chunks(&track_url, &track_token)
+            .await?;
+
+        let url_chunks = self.get_chunks(&url_with_chunks).await?;
+
+        self.stream_chunks(url_chunks).await
+    }
+
+
+    async fn stream_chunks(self: Arc<Self>, url_chunks: Vec<String>) -> Result<ByteStream, SoundcloudError> {
         let stream = stream! {
             // Iterate through each of your chunk URLs
             for url_chunk in url_chunks.into_iter() {
                 // 1. Get the Result<ByteStream, ...> for this specific chunk
-                let sub_stream_result = self_clone.stream_chunk(url_chunk).await;
+                let sub_stream_result = self.stream_chunk(url_chunk).await;
 
                 match sub_stream_result {
                     // 2. If you successfully got a sub-stream of bytes...
@@ -206,13 +251,25 @@ impl SoundCloudApi {
         Ok(stream.boxed())
     }
 
-    pub async fn stream_and_save(
+    pub async fn stream_and_save_by_id(self: Arc<Self>, id: String) -> Result<BroadcastStreamBodyWrapper, SoundcloudError> {
+        let url_chunks = self.get_chunks_by_id(&id).await?;
+        self.stream_and_save(id, url_chunks).await
+    }
+
+    pub async fn stream_and_save_by_token(self: Arc<Self>, id: String, track_url: String, track_token: String) -> Result<BroadcastStreamBodyWrapper, SoundcloudError> {
+        let url_with_chunks = self
+            .get_url_to_chunks(&track_url, &track_token)
+            .await?;
+
+        let url_chunks = self.get_chunks(&url_with_chunks).await?;
+        self.stream_and_save(id, url_chunks).await
+    }
+
+    async fn stream_and_save(
         self: Arc<Self>,
         id: String,
+        url_chunks: Vec<String>,
     ) -> Result<BroadcastStreamBodyWrapper, SoundcloudError> {
-        // 1. Get chunk URLs
-        let url_chunks = self.get_chunks_by_id(&id).await?;
-
         // 2. Create the broadcast channel
         let (tx, _): (broadcast::Sender<Result<Bytes, BodyStreamError>>, broadcast::Receiver<Result<Bytes, BodyStreamError>>) = broadcast::channel(1024);
 
