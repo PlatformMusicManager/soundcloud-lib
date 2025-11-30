@@ -5,11 +5,13 @@ use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use thiserror::Error;
+use std::error::Error as StdError;
 use aws_sdk_s3::Client as S3Client;
-use aws_sdk_s3::primitives::SdkBody;
 use bytes::Bytes;
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use aws_sdk_s3::primitives::ByteStream as SdkByteStream;
 use tokio::sync::broadcast;
-use tokio::sync::broadcast::error::SendError;
+use tokio::sync::broadcast::error::{SendError, RecvError};
 use log::{error, info, debug};
 use tokio_stream::wrappers::BroadcastStream;
 use crate::byte_stream::{BodyStreamError, BroadcastStreamBodyWrapper, ByteStream};
@@ -30,6 +32,7 @@ pub struct SoundCloudApi {
     client_id: String,
     url_re: Regex,
     bucket_name: String,
+    part_size: usize,
 }
 
 #[derive(Error, Debug)]
@@ -57,14 +60,16 @@ impl SoundCloudApi {
     pub async fn new(
         client_id: String,
         s3_client: S3Client,
-        bucket_name: String
+        bucket_name: String,
+        part_size: usize,
     )-> Self {
         Self {
             s3_client,
             client: Client::new(),
             client_id,
             url_re: Regex::new(r#"https:?:[^\s"]+"#).unwrap(),
-            bucket_name
+            bucket_name,
+            part_size,
         }
     }
 
@@ -75,7 +80,7 @@ impl SoundCloudApi {
         limit: &str,
     ) -> Result<SearchResponse, SoundcloudError> {
         let url = Url::parse_with_params(
-            format!("{}/search", BASE_URL).as_str(),
+            concat!(BASE_URL, "/search"),
             &[
                 ("q", query),
                 ("client_id", self.client_id.as_str()),
@@ -93,7 +98,7 @@ impl SoundCloudApi {
 
     pub async fn get_track_data(&self, ids: &str) -> Result<Vec<TrackData>, SoundcloudError> {
         let url = Url::parse_with_params(
-            format!("{BASE_URL}/tracks").as_str(),
+            concat!(BASE_URL, "/tracks"),
             &[("ids", ids), ("client_id", self.client_id.as_str())],
         )?;
         let req = self.client.get(url).build()?;
@@ -209,33 +214,206 @@ impl SoundCloudApi {
         let url_chunks = self.get_chunks_by_id(&id).await?;
 
         // 2. Create the broadcast channel
-        let (tx, _rx) = broadcast::channel(16);
+        let (tx, _): (broadcast::Sender<Result<Bytes, BodyStreamError>>, broadcast::Receiver<Result<Bytes, BodyStreamError>>) = broadcast::channel(1024);
 
         // --- S3 Uploader Setup ---
-        let s3_rx = tx.subscribe();
-        let s3_stream = BroadcastStream::new(s3_rx);
-        let s3_body_wrapper = BroadcastStreamBodyWrapper::new(s3_stream);
-        let sdk_body = SdkBody::from_body_1_x(s3_body_wrapper); // Your specific conversion
-
+        let mut s3_rx = tx.subscribe();
         let self_for_s3 = Arc::clone(&self);
         let s3_id = id.clone(); // Clone id for the S3 task
 
         // --- Task 1: The S3 Uploader ---
         tokio::spawn(async move {
-            // REFINEMENT 1: Handle the Result instead of using .expect()
-            let result = self_for_s3.s3_client
-                .put_object()
-                .bucket(&self_for_s3.bucket_name)
-                .key(s3_id.clone())
-                .body(sdk_body.into())
-                .send()
-                .await;
+            let part_size = self_for_s3.part_size;
+            let mut buffer = Vec::with_capacity(part_size);
+            let threshold = part_size; // Use configured part size as threshold
+            let min_part_size = 5 * 1024 * 1024; // 5MB minimum part size (S3 limit)
+            let mut upload_id: Option<String> = None;
+            let mut parts = Vec::new();
+            let mut part_number = 1;
 
-            if let Err(e) = result {
-                // Now you have a proper error log instead of a silent panic
-                error!("Failed to upload object with id: {} to S3. Error: {}", s3_id, e);
+            info!("Started processing object with id: {} for S3 upload", s3_id);
+
+            loop {
+                match s3_rx.recv().await {
+                    Ok(chunk_res) => {
+                        match chunk_res {
+                            Ok(bytes) => {
+                                buffer.extend_from_slice(&bytes);
+
+                                // Check if we need to switch to multipart
+                                if upload_id.is_none() {
+                                    if buffer.len() >= threshold {
+                                        // Start multipart upload
+                                        info!("Buffer reached {} bytes. Starting multipart upload for id: {}", buffer.len(), s3_id);
+                                        let create_res = self_for_s3.s3_client
+                                            .create_multipart_upload()
+                                            .bucket(&self_for_s3.bucket_name)
+                                            .key(&s3_id)
+                                            .send()
+                                            .await;
+
+                                        match create_res {
+                                            Ok(output) => {
+                                                upload_id = output.upload_id;
+                                            }
+                                            Err(e) => {
+                                                error!("Failed to create multipart upload for id: {}. Error: {:?}", s3_id, e);
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // If multipart is active, check if we can upload a part
+                                if let Some(uid) = &upload_id {
+                                    if buffer.len() >= min_part_size {
+                                        // Clear buffer immediately to free memory, though we just cloned it.
+                                        // Ideally we would split off, but for simplicity:
+                                        let part_data = buffer.clone();
+                                        buffer.clear();
+
+                                        let part_res = self_for_s3.s3_client
+                                            .upload_part()
+                                            .bucket(&self_for_s3.bucket_name)
+                                            .key(&s3_id)
+                                            .upload_id(uid)
+                                            .part_number(part_number)
+                                            .body(SdkByteStream::from(part_data))
+                                            .send()
+                                            .await;
+
+                                        match part_res {
+                                            Ok(output) => {
+                                                parts.push(CompletedPart::builder()
+                                                    .part_number(part_number)
+                                                    .set_e_tag(output.e_tag)
+                                                    .build());
+                                                part_number += 1;
+                                            }
+                                            Err(e) => {
+                                                error!("Failed to upload part {} for id: {}. Error: {:?}", part_number, s3_id, e);
+                                                // Abort multipart
+                                                let _ = self_for_s3.s3_client
+                                                    .abort_multipart_upload()
+                                                    .bucket(&self_for_s3.bucket_name)
+                                                    .key(&s3_id)
+                                                    .upload_id(uid)
+                                                    .send()
+                                                    .await;
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("Stream error received for id: {}: {:?}", s3_id, e);
+                                if let Some(uid) = upload_id {
+                                     let _ = self_for_s3.s3_client
+                                        .abort_multipart_upload()
+                                        .bucket(&self_for_s3.bucket_name)
+                                        .key(&s3_id)
+                                        .upload_id(uid)
+                                        .send()
+                                        .await;
+                                }
+                                return;
+                            }
+                        }
+                    }
+                    Err(RecvError::Closed) => {
+                        debug!("Stream closed for id: {}", s3_id);
+                        break;
+                    }
+                    Err(RecvError::Lagged(skipped)) => {
+                        error!("Stream lagged for id: {}, skipped {} messages", s3_id, skipped);
+                        if let Some(uid) = upload_id {
+                             let _ = self_for_s3.s3_client
+                                .abort_multipart_upload()
+                                .bucket(&self_for_s3.bucket_name)
+                                .key(&s3_id)
+                                .upload_id(uid)
+                                .send()
+                                .await;
+                        }
+                        return;
+                    }
+                }
+            }
+
+            // Finalize
+            if let Some(uid) = upload_id {
+                // Upload remaining buffer as last part if not empty
+                if !buffer.is_empty() {
+                    let part_res = self_for_s3.s3_client
+                        .upload_part()
+                        .bucket(&self_for_s3.bucket_name)
+                        .key(&s3_id)
+                        .upload_id(&uid)
+                        .part_number(part_number)
+                        .body(SdkByteStream::from(buffer))
+                        .send()
+                        .await;
+
+                    match part_res {
+                        Ok(output) => {
+                             parts.push(CompletedPart::builder()
+                                .part_number(part_number)
+                                .set_e_tag(output.e_tag)
+                                .build());
+                        }
+                        Err(e) => {
+                            error!("Failed to upload last part for id: {}. Error: {:?}", s3_id, e);
+                            let _ = self_for_s3.s3_client
+                                .abort_multipart_upload()
+                                .bucket(&self_for_s3.bucket_name)
+                                .key(&s3_id)
+                                .upload_id(&uid)
+                                .send()
+                                .await;
+                            return;
+                        }
+                    }
+                }
+
+                // Complete multipart upload
+                let completed_multipart_upload = CompletedMultipartUpload::builder()
+                    .set_parts(Some(parts))
+                    .build();
+
+                let complete_res = self_for_s3.s3_client
+                    .complete_multipart_upload()
+                    .bucket(&self_for_s3.bucket_name)
+                    .key(&s3_id)
+                    .upload_id(&uid)
+                    .multipart_upload(completed_multipart_upload)
+                    .send()
+                    .await;
+
+                match complete_res {
+                    Ok(_) => info!("Successfully completed multipart upload for id: {}", s3_id),
+                    Err(e) => error!("Failed to complete multipart upload for id: {}. Error: {:?}", s3_id, e),
+                }
+
             } else {
-                info!("Successfully uploaded object with id: {}", s3_id);
+                // Single put
+                info!("Uploading single object for id: {} (size: {} bytes)", s3_id, buffer.len());
+                let result = self_for_s3.s3_client
+                    .put_object()
+                    .bucket(&self_for_s3.bucket_name)
+                    .key(&s3_id)
+                    .body(SdkByteStream::from(buffer))
+                    .send()
+                    .await;
+
+                if let Err(e) = result {
+                    error!("Failed to upload single object with id: {}. Error: {:?}", s3_id, e);
+                     if let Some(source) = e.source() {
+                         error!("Caused by: {:?}", source);
+                    }
+                } else {
+                    info!("Successfully uploaded single object with id: {}", s3_id);
+                }
             }
         });
 
