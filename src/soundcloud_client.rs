@@ -10,6 +10,7 @@ use aws_sdk_s3::Client as S3Client;
 use bytes::Bytes;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_sdk_s3::primitives::ByteStream as SdkByteStream;
+use axum::body::Body as AxumBody;
 use axum::response::{IntoResponse, Response};
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::{SendError, RecvError};
@@ -21,6 +22,7 @@ use crate::models::search::SearchResponse;
 use crate::models::track::TrackData;
 use const_format::formatcp;
 use domain::create_json_error_str;
+use http_body::Body;
 use crate::soundcloud_client::SoundcloudError::InvalidRequestToSoundcloud;
 
 const BASE_URL: &'static str = "https://api-v2.soundcloud.com";
@@ -204,22 +206,29 @@ impl SoundCloudApi {
         Ok(stream)
     }
 
-    pub async fn stream_by_id(self: Arc<Self>, id: String) -> Result<ByteStream, SoundcloudError> {
-        let url_chunks = self.get_chunks_by_id(&id).await?;
 
-        self.stream_chunks(url_chunks).await
+    pub async fn stream(
+        self: Arc<Self>,
+        id: String,
+        save: bool,
+        track_url: Option<String>,
+        track_token: Option<String>
+    ) -> Result<AxumBody, SoundcloudError> {
+        let url_chunks = match (track_url, track_token) {
+            (Some(track_url), Some(track_token)) => {
+                let url_with_chunks = self.get_url_to_chunks(&track_url, &track_token).await?;
+                self.get_chunks(&url_with_chunks).await?
+            }
+            _ => self.get_chunks_by_id(&id).await?
+        };
+
+        let body = match save {
+            true => AxumBody::new(self.stream_and_save(id, url_chunks).await?),
+            false => AxumBody::from_stream(self.stream_chunks(url_chunks).await?)
+        };
+
+        Ok(body)
     }
-
-    pub async fn stream_by_token(self: Arc<Self>, track_url: String, track_token: String) -> Result<ByteStream, SoundcloudError> {
-        let url_with_chunks = self
-            .get_url_to_chunks(&track_url, &track_token)
-            .await?;
-
-        let url_chunks = self.get_chunks(&url_with_chunks).await?;
-
-        self.stream_chunks(url_chunks).await
-    }
-
 
     async fn stream_chunks(self: Arc<Self>, url_chunks: Vec<String>) -> Result<ByteStream, SoundcloudError> {
         let stream = stream! {
@@ -249,20 +258,6 @@ impl SoundCloudApi {
         };
 
         Ok(stream.boxed())
-    }
-
-    pub async fn stream_and_save_by_id(self: Arc<Self>, id: String) -> Result<BroadcastStreamBodyWrapper, SoundcloudError> {
-        let url_chunks = self.get_chunks_by_id(&id).await?;
-        self.stream_and_save(id, url_chunks).await
-    }
-
-    pub async fn stream_and_save_by_token(self: Arc<Self>, id: String, track_url: String, track_token: String) -> Result<BroadcastStreamBodyWrapper, SoundcloudError> {
-        let url_with_chunks = self
-            .get_url_to_chunks(&track_url, &track_token)
-            .await?;
-
-        let url_chunks = self.get_chunks(&url_with_chunks).await?;
-        self.stream_and_save(id, url_chunks).await
     }
 
     async fn stream_and_save(
