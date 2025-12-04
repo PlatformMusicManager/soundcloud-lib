@@ -22,8 +22,9 @@ use crate::models::search::SearchResponse;
 use crate::models::track::TrackData;
 use const_format::formatcp;
 use domain::create_json_error_str;
+use domain::errors::music_services::soundcloud_api_error::SoundcloudApiError;
 use http_body::Body;
-use crate::soundcloud_client::SoundcloudError::InvalidRequestToSoundcloud;
+use crate::models::playlist::PlaylistData;
 
 const BASE_URL: &'static str = "https://api-v2.soundcloud.com";
 
@@ -39,54 +40,6 @@ pub struct SoundCloudApi {
     url_re: Regex,
     bucket_name: String,
     part_size: usize,
-}
-
-#[derive(Error, Debug)]
-pub enum SoundcloudError {
-    #[error("Invalid request to SoundCloud")]
-    InvalidRequestToSoundcloud(#[from] reqwest::Error),
-
-    #[error("Error while creating URL for SoundCloud request, invalid data was provided")]
-    UrlParseError(#[from] ParseError),
-
-    #[error("Error while deserialize")]
-    DeserializeError(#[from] serde_json::Error),
-
-    #[error("No data for track in response")]
-    NoTrackDataInResponse(),
-
-    #[error("No media data attached in track in response")]
-    NoMediaDataInResponse(),
-
-    #[error("Tx send error")]
-    TxSendError(#[from] SendError<Result<Bytes, BodyStreamError>>),
-}
-
-impl IntoResponse for SoundcloudError{
-    fn into_response(self) -> Response {
-        let res = match self {
-            InvalidRequestToSoundcloud(_) => {
-                create_json_error_str!("InvalidRequestToSoundcloud");
-            }
-            SoundcloudError::UrlParseError(_) => {
-                create_json_error_str!("Fail to parse URL with provided params");
-            }
-            SoundcloudError::DeserializeError(_) => {
-                create_json_error_str!("Deserialize soundcloud response error");
-            }
-            SoundcloudError::NoTrackDataInResponse() => {
-                create_json_error_str!("No track data in response");
-            }
-            SoundcloudError::NoMediaDataInResponse() => {
-                create_json_error_str!("No media data in response");
-            }
-            SoundcloudError::TxSendError(_) => {
-                create_json_error_str!("Tx send error");
-            }
-        };
-
-        res.into_response()
-    }
 }
 
 impl SoundCloudApi {
@@ -111,7 +64,7 @@ impl SoundCloudApi {
         query: &str,
         offset: &str,
         limit: &str,
-    ) -> Result<SearchResponse, SoundcloudError> {
+    ) -> Result<SearchResponse, SoundcloudApiError> {
         let url = Url::parse_with_params(
             formatcp!("{}/search", BASE_URL),
             &[
@@ -129,7 +82,20 @@ impl SoundCloudApi {
         Ok(search_res)
     }
 
-    pub async fn get_track_data(&self, ids: &str) -> Result<Vec<TrackData>, SoundcloudError> {
+    pub async fn get_playlist(&self, id: &str) -> Result<PlaylistData, SoundcloudApiError> {
+        let url = Url::parse(
+            &format!("{}{}", formatcp!("{}/playlists/", BASE_URL), id),
+        )?;
+
+        let req = self.client.get(url).build()?;
+        let res = self.client.execute(req).await?.text().await?;
+
+        let playlist: PlaylistData = serde_json::from_str(&res)?;
+
+        Ok(playlist)
+    }
+
+    pub async fn get_track_data(&self, ids: &str) -> Result<Vec<TrackData>, SoundcloudApiError> {
         let url = Url::parse_with_params(
             formatcp!("{}/tracks", BASE_URL),
             &[("ids", ids), ("client_id", &self.client_id)],
@@ -145,7 +111,7 @@ impl SoundCloudApi {
         &self,
         url: &str,
         track_authorization: &str,
-    ) -> Result<String, SoundcloudError> {
+    ) -> Result<String, SoundcloudApiError> {
         let url = Url::parse_with_params(
             url,
             &[
@@ -160,7 +126,7 @@ impl SoundCloudApi {
         Ok(urls.url)
     }
 
-    pub async fn get_chunks(&self, url: &str) -> Result<Vec<String>, SoundcloudError> {
+    pub async fn get_chunks(&self, url: &str) -> Result<Vec<String>, SoundcloudApiError> {
         let req = self.client.get(url).build()?;
         let res = self.client.execute(req).await?.text().await?;
         let urls: Vec<String> = self
@@ -172,19 +138,19 @@ impl SoundCloudApi {
         Ok(urls)
     }
 
-    pub async fn get_chunks_by_id(&self, id: &str) -> Result<Vec<String>, SoundcloudError> {
+    pub async fn get_chunks_by_id(&self, id: &str) -> Result<Vec<String>, SoundcloudApiError> {
         let track_data = self.get_track_data(id).await?;
 
         let track = track_data
             .first()
-            .ok_or_else(SoundcloudError::NoTrackDataInResponse)?;
+            .ok_or_else(SoundcloudApiError::NoTrackDataInResponse)?;
 
         // Picking first available audio, first one is always highest quality
         let media_data = track
             .media
             .transcodings
             .first()
-            .ok_or_else(SoundcloudError::NoMediaDataInResponse)?;
+            .ok_or_else(SoundcloudApiError::NoMediaDataInResponse)?;
 
         let url_with_chunks = self
             .get_url_to_chunks(&media_data.url, &track.track_authorization)
@@ -195,7 +161,7 @@ impl SoundCloudApi {
         Ok(url_chunks)
     }
 
-    async fn stream_chunk(&self, url: String) -> Result<ByteStream, SoundcloudError> {
+    async fn stream_chunk(&self, url: String) -> Result<ByteStream, SoundcloudApiError> {
         let response = self.client.get(url).send().await?;
 
         let stream = response
@@ -213,7 +179,7 @@ impl SoundCloudApi {
         save: bool,
         track_url: Option<String>,
         track_token: Option<String>
-    ) -> Result<AxumBody, SoundcloudError> {
+    ) -> Result<AxumBody, SoundcloudApiError> {
         let url_chunks = match (track_url, track_token) {
             (Some(track_url), Some(track_token)) => {
                 let url_with_chunks = self.get_url_to_chunks(&track_url, &track_token).await?;
@@ -230,7 +196,7 @@ impl SoundCloudApi {
         Ok(body)
     }
 
-    async fn stream_chunks(self: Arc<Self>, url_chunks: Vec<String>) -> Result<ByteStream, SoundcloudError> {
+    async fn stream_chunks(self: Arc<Self>, url_chunks: Vec<String>) -> Result<ByteStream, SoundcloudApiError> {
         let stream = stream! {
             // Iterate through each of your chunk URLs
             for url_chunk in url_chunks.into_iter() {
@@ -264,7 +230,7 @@ impl SoundCloudApi {
         self: Arc<Self>,
         id: String,
         url_chunks: Vec<String>,
-    ) -> Result<BroadcastStreamBodyWrapper, SoundcloudError> {
+    ) -> Result<BroadcastStreamBodyWrapper, SoundcloudApiError> {
         // 2. Create the broadcast channel
         let (tx, _): (broadcast::Sender<Result<Bytes, BodyStreamError>>, broadcast::Receiver<Result<Bytes, BodyStreamError>>) = broadcast::channel(1024);
 
