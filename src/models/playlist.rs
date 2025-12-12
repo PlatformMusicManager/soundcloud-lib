@@ -2,7 +2,7 @@ use domain::models::db::soundcloud::{AuthorInputSoundcloud, CreateReplacePlaylis
 use domain::models::music_api::playlist::ApiPlaylist;
 use domain::models::music_api::track::ApiTrack;
 use serde::{Deserialize, Serialize};
-use crate::models::track::TrackData;
+use crate::models::track::{Track, TrackData};
 use crate::models::user::User;
 
 // #[derive(Deserialize, Serialize, Clone)]
@@ -12,7 +12,7 @@ use crate::models::user::User;
 //     Partial { id: i64 }, // A struct for the minimal objects
 // }
 
-#[derive(Deserialize, Serialize, Clone)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct PlaylistData {
     pub id: i64,
     pub title: String,
@@ -22,8 +22,8 @@ pub struct PlaylistData {
     pub tracks: TracksList,
 }
 
-#[derive(Deserialize, Serialize, Clone)]
-pub struct TracksList (pub Vec<TrackData>);
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct TracksList (pub Vec<Track>);
 
 impl Into<(Vec<TrackInputSoundcloud>, Vec<AuthorInputSoundcloud>)> for TracksList {
     fn into(self) -> (Vec<TrackInputSoundcloud>, Vec<AuthorInputSoundcloud>) {
@@ -33,8 +33,10 @@ impl Into<(Vec<TrackInputSoundcloud>, Vec<AuthorInputSoundcloud>)> for TracksLis
         let mut authors = Vec::with_capacity(len / 2);
 
         self.0.into_iter().for_each(|track| {
-            authors.push(track.user.clone().into());
-            tracks.push(track.into());
+            if let Track::Full(track) = track {
+                authors.push(track.user.clone().into());
+                tracks.push(track.into());
+            }
         });
 
         (tracks, authors)
@@ -71,7 +73,14 @@ impl Into<ApiPlaylist> for PlaylistData {
             parent_picture: self.user.avatar_url,
             picture: self.artwork_url,
             size: self.tracks.0.len() as u32,
-            tracks: self.tracks.0.into_iter().map(|el| el.into()).collect()
+            tracks: self.tracks.0.into_iter()
+                .filter_map(|el| {
+                    match el {
+                        Track::Full(data) => Some(data.into()),
+                        Track::Stub(_) => None,
+                    }
+                })
+                .collect()
         }
     }
 }

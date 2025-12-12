@@ -1,19 +1,47 @@
+use domain::errors::music_services::soundcloud_api_error::SoundcloudApiError;
 use domain::models::db::soundcloud::TrackInputSoundcloud;
-use domain::models::music_api::services::ApiServices;
 use domain::models::music_api::services::ApiServices::Soundcloud;
 use domain::models::music_api::track::ApiTrack;
 use serde::{Deserialize, Serialize};
 use crate::models::user::User;
 
-#[derive(Deserialize, Serialize, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
+#[serde(untagged)]
+pub enum Track {
+    // Serde attempts this FIRST.
+    // If the JSON has `title` and `user`, this succeeds.
+    Full(TrackData),
+
+    // If the above fails, Serde attempts this.
+    Stub(StubTrackData),
+}
+
+impl TryInto<ApiTrack> for Track {
+    type Error = SoundcloudApiError;
+
+    fn try_into(self) -> Result<ApiTrack, Self::Error> {
+        let Track::Full(track_data) = self else {
+            return Err(SoundcloudApiError::TrackDataIsNotFull)
+        };
+
+        Ok(track_data.into())
+    }
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct TrackData {
     pub id: i64,
     pub title: String,
     pub artwork_url: Option<String>,
-    pub duration: i32,
+    pub duration: i64,
     pub media: Media,
     pub track_authorization: String,
     pub user: User,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct StubTrackData {
+    pub id: i64
 }
 
 impl Into<TrackInputSoundcloud> for TrackData {
@@ -37,19 +65,25 @@ impl Into<ApiTrack> for TrackData {
             artists: vec![self.user.into()],
             alb_id: None,
             alb_title: None,
-            duration: 0,
-            track_url: None,
-            track_token: None,
+            duration: self.duration,
+            track_url: self.media.get_best_media().map(|media| media.url.clone()),
+            track_token: Some(self.track_authorization),
         }
     }
 }
 
-#[derive(Deserialize, Serialize, Clone)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct Media {
     pub transcodings: Vec<EncodingData>,
 }
 
-#[derive(Deserialize, Serialize, Clone)]
+impl Media {
+    pub fn get_best_media(&self) -> Option<&EncodingData> {
+        self.transcodings.first()
+    }
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct EncodingData {
     pub url: String,
     pub preset: Option<String>,
@@ -60,7 +94,7 @@ pub struct EncodingData {
     pub is_legacy_transcoding: Option<bool>,
 }
 
-#[derive(Deserialize, Serialize, Clone)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct FormatData {
     pub protocol: String,
     pub mime_type: String,

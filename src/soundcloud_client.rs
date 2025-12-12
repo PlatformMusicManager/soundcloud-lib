@@ -19,7 +19,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use crate::byte_stream::{BodyStreamError, BroadcastStreamBodyWrapper, ByteStream};
 use url::ParseError;
 use crate::models::search::SearchResponse;
-use crate::models::track::TrackData;
+use crate::models::track::{Track, TrackData};
 use const_format::formatcp;
 use domain::create_json_error_str;
 use domain::errors::music_services::soundcloud_api_error::SoundcloudApiError;
@@ -95,14 +95,30 @@ impl SoundCloudApi {
         Ok(playlist)
     }
 
-    pub async fn get_track_data(&self, ids: &str) -> Result<Vec<TrackData>, SoundcloudApiError> {
+    pub async fn get_track_data(&self, id: &str) -> Result<Track, SoundcloudApiError> {
+        let url = Url::parse_with_params(
+                &format!(
+                    "{}{}",
+                    formatcp!("{}/track/", BASE_URL),
+                    id
+                ),
+            &[("client_id", &self.client_id)],
+        )?;
+        let req = self.client.get(url).build()?;
+        let res = self.client.execute(req).await?.text().await?;
+        let track: Track = serde_json::from_str(&res)?;
+
+        Ok(track)
+    }
+
+    pub async fn get_tracks_data(&self, ids: &str) -> Result<Vec<Track>, SoundcloudApiError> {
         let url = Url::parse_with_params(
             formatcp!("{}/tracks", BASE_URL),
             &[("ids", ids), ("client_id", &self.client_id)],
         )?;
         let req = self.client.get(url).build()?;
         let res = self.client.execute(req).await?.text().await?;
-        let track: Vec<TrackData> = serde_json::from_str(&res)?;
+        let track: Vec<Track> = serde_json::from_str(&res)?;
 
         Ok(track)
     }
@@ -141,16 +157,15 @@ impl SoundCloudApi {
     pub async fn get_chunks_by_id(&self, id: &str) -> Result<Vec<String>, SoundcloudApiError> {
         let track_data = self.get_track_data(id).await?;
 
-        let track = track_data
-            .first()
-            .ok_or_else(SoundcloudApiError::NoTrackDataInResponse)?;
+        let Track::Full(track) = track_data else {
+            return Err(SoundcloudApiError::TrackDataIsNotFull)
+        };
 
         // Picking first available audio, first one is always highest quality
         let media_data = track
             .media
-            .transcodings
-            .first()
-            .ok_or_else(SoundcloudApiError::NoMediaDataInResponse)?;
+            .get_best_media()
+            .ok_or(SoundcloudApiError::NoMediaDataInResponse)?;
 
         let url_with_chunks = self
             .get_url_to_chunks(&media_data.url, &track.track_authorization)

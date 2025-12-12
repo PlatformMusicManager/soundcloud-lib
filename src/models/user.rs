@@ -2,7 +2,7 @@ use domain::models::db::soundcloud::AuthorInputSoundcloud;
 use domain::models::music_api::artist::ApiArtist;
 use serde::{Deserialize, Serialize};
 
-#[derive(Deserialize, Serialize, Clone)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct User {
     pub id: i64,
     pub avatar_url: Option<String>,

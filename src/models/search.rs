@@ -4,17 +4,18 @@ use domain::models::music_api::search_results::ApiSearchPage;
 use domain::models::music_api::track::ApiTrack;
 use serde::{Deserialize, Serialize};
 use crate::models::playlist::PlaylistData;
-use crate::models::track::TrackData;
+use crate::models::track::{Track, TrackData};
 use crate::models::user::User;
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(tag = "kind", rename_all = "lowercase")]
 pub enum SearchItem {
     Playlist(PlaylistData),
-    Track(TrackData),
+    Track(Track),
     User(User),
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Debug)]
 pub struct SearchResponse {
     pub collection: Vec<SearchItem>,
 }
@@ -30,8 +31,11 @@ impl Into<ApiSearchPage> for SearchResponse {
                     SearchItem::Playlist(pl) => {
                         playlists.push(pl.into());
                     }
-                    SearchItem::Track(tr) => {
+                    SearchItem::Track(Track::Full(tr)) => {
                         tracks.push(tr.into());
+                    }
+                    SearchItem::Track(Track::Stub(_)) => {
+
                     }
                     SearchItem::User(us) => {
                         artists.push(us.into());
