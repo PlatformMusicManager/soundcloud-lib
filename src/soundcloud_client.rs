@@ -117,8 +117,9 @@ impl SoundCloudApi {
     }
 
     pub async fn get_playlist(&self, id: &str) -> Result<PlaylistData, SoundcloudApiError> {
-        let url = Url::parse(
+        let url = Url::parse_with_params(
             &format!("{}{}", formatcp!("{}/playlists/", BASE_URL), id),
+            &[("client_id", &self.client_id)]
         )?;
 
         let res = self.make_req_deserialize(url).await?;
