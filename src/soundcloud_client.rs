@@ -1,11 +1,13 @@
+use std::collections::HashMap;
 use async_stream::stream;
 use futures::{StreamExt, TryStreamExt};
 use regex::Regex;
-use reqwest::{Client, Url};
+use reqwest::{Client, Request, Url};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use thiserror::Error;
 use std::error::Error as StdError;
+use std::iter::{Extend, IntoIterator};
 use aws_sdk_s3::Client as S3Client;
 use bytes::Bytes;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
@@ -24,6 +26,8 @@ use const_format::formatcp;
 use domain::create_json_error_str;
 use domain::errors::music_services::soundcloud_api_error::SoundcloudApiError;
 use http_body::Body;
+use reqwest::header::{HeaderMap, HeaderValue};
+use serde::de::DeserializeOwned;
 use crate::models::playlist::PlaylistData;
 
 const BASE_URL: &'static str = "https://api-v2.soundcloud.com";
@@ -49,14 +53,47 @@ impl SoundCloudApi {
         bucket_name: String,
         part_size: usize,
     )-> Self {
+        let mut headers = HeaderMap::new();
+        headers.insert("Host", HeaderValue::from_static("api-v2.soundcloud.com"));
+        headers.insert("User-Agent", HeaderValue::from_static(
+            "User-Agent Mozilla/5.0 (X11; Linux x86_64; rv:146.0) Gecko/20100101 Firefox/146.0"
+        ));
+
         Self {
             s3_client,
-            client: Client::new(),
+            client: Client::builder().default_headers(headers).build().unwrap(),
             client_id,
             url_re: Regex::new(r#"https:?:[^\s"]+"#).unwrap(),
             bucket_name,
             part_size,
         }
+    }
+
+    async fn make_req(
+        &self,
+        url: Url
+    ) -> Result<reqwest::Response, SoundcloudApiError> {
+        let res = self.client.get(url)
+            .send()
+            .await?
+            .error_for_status()?;
+
+        Ok(res)
+    }
+
+    async fn make_req_deserialize<T: for<'a> Deserialize<'a>>(
+        &self,
+        url: Url
+    ) -> Result<T, SoundcloudApiError> {
+        let req = self.client.get(url).build()?;
+
+        let res = self.client.execute(req)
+            .await?
+            .error_for_status()?
+            .text()
+            .await?;
+
+        Ok(serde_json::from_str(&res)?)
     }
 
     pub async fn search(
@@ -75,11 +112,8 @@ impl SoundCloudApi {
             ],
         )?;
 
-        let req = self.client.get(url).build()?;
-        let res = self.client.execute(req).await?.text().await?;
-
-        let search_res: SearchResponse = serde_json::from_str(&res)?;
-        Ok(search_res)
+        let res = self.make_req_deserialize(url).await?;
+        Ok(res)
     }
 
     pub async fn get_playlist(&self, id: &str) -> Result<PlaylistData, SoundcloudApiError> {
@@ -87,28 +121,22 @@ impl SoundCloudApi {
             &format!("{}{}", formatcp!("{}/playlists/", BASE_URL), id),
         )?;
 
-        let req = self.client.get(url).build()?;
-        let res = self.client.execute(req).await?.text().await?;
-
-        let playlist: PlaylistData = serde_json::from_str(&res)?;
-
-        Ok(playlist)
+        let res = self.make_req_deserialize(url).await?;
+        Ok(res)
     }
 
     pub async fn get_track_data(&self, id: &str) -> Result<Track, SoundcloudApiError> {
         let url = Url::parse_with_params(
                 &format!(
                     "{}{}",
-                    formatcp!("{}/track/", BASE_URL),
+                    formatcp!("{}/tracks/", BASE_URL),
                     id
                 ),
             &[("client_id", &self.client_id)],
         )?;
-        let req = self.client.get(url).build()?;
-        let res = self.client.execute(req).await?.text().await?;
-        let track: Track = serde_json::from_str(&res)?;
 
-        Ok(track)
+        let res = self.make_req_deserialize(url).await?;
+        Ok(res)
     }
 
     pub async fn get_tracks_data(&self, ids: &str) -> Result<Vec<Track>, SoundcloudApiError> {
@@ -116,11 +144,9 @@ impl SoundCloudApi {
             formatcp!("{}/tracks", BASE_URL),
             &[("ids", ids), ("client_id", &self.client_id)],
         )?;
-        let req = self.client.get(url).build()?;
-        let res = self.client.execute(req).await?.text().await?;
-        let track: Vec<Track> = serde_json::from_str(&res)?;
 
-        Ok(track)
+        let res = self.make_req_deserialize(url).await?;
+        Ok(res)
     }
 
     pub async fn get_url_to_chunks(
@@ -135,16 +161,16 @@ impl SoundCloudApi {
                 ("track_authorization", track_authorization),
             ],
         )?;
-        let req = self.client.get(url).build()?;
-        let res = self.client.execute(req).await?.text().await?;
-        let urls: ChunkUrl = serde_json::from_str(&res)?;
 
-        Ok(urls.url)
+        let res: ChunkUrl = self.make_req_deserialize(url).await?;
+        Ok(res.url)
     }
 
     pub async fn get_chunks(&self, url: &str) -> Result<Vec<String>, SoundcloudApiError> {
-        let req = self.client.get(url).build()?;
-        let res = self.client.execute(req).await?.text().await?;
+        let res: String = self.make_req_deserialize(
+            Url::parse(url)?
+        ).await?;
+
         let urls: Vec<String> = self
             .url_re
             .find_iter(res.as_str())
@@ -176,8 +202,10 @@ impl SoundCloudApi {
         Ok(url_chunks)
     }
 
-    async fn stream_chunk(&self, url: String) -> Result<ByteStream, SoundcloudApiError> {
-        let response = self.client.get(url).send().await?;
+    async fn stream_chunk(&self, url: &str) -> Result<ByteStream, SoundcloudApiError> {
+        let response = self.make_req(
+            Url::parse(&url)?
+        ).await?;
 
         let stream = response
             .bytes_stream()
@@ -216,7 +244,7 @@ impl SoundCloudApi {
             // Iterate through each of your chunk URLs
             for url_chunk in url_chunks.into_iter() {
                 // 1. Get the Result<ByteStream, ...> for this specific chunk
-                let sub_stream_result = self.stream_chunk(url_chunk).await;
+                let sub_stream_result = self.stream_chunk(&url_chunk).await;
 
                 match sub_stream_result {
                     // 2. If you successfully got a sub-stream of bytes...
@@ -457,7 +485,7 @@ impl SoundCloudApi {
         // --- Task 2: The Downloader ---
         tokio::spawn(async move {
             for url_chunk in url_chunks.into_iter() {
-                match self_for_downloader.stream_chunk(url_chunk).await {
+                match self_for_downloader.stream_chunk(&url_chunk).await {
                     Ok(mut sub_stream) => {
                         while let Some(bytes_result) = sub_stream.next().await {
                             // REFINEMENT 3: Log when stopping

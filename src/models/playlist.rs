@@ -34,8 +34,9 @@ impl Into<(Vec<TrackInputSoundcloud>, Vec<AuthorInputSoundcloud>)> for TracksLis
 
         self.0.into_iter().for_each(|track| {
             if let Track::Full(track) = track {
-                authors.push(track.user.clone().into());
-                tracks.push(track.into());
+                let (track_i, author_i) = track.into();
+                tracks.push(track_i);
+                authors.push(author_i);
             }
         });
 

@@ -1,5 +1,5 @@
 use domain::errors::music_services::soundcloud_api_error::SoundcloudApiError;
-use domain::models::db::soundcloud::TrackInputSoundcloud;
+use domain::models::db::soundcloud::{AuthorInputSoundcloud, TrackInputSoundcloud};
 use domain::models::music_api::services::ApiServices::Soundcloud;
 use domain::models::music_api::track::ApiTrack;
 use serde::{Deserialize, Serialize};
@@ -16,15 +16,15 @@ pub enum Track {
     Stub(StubTrackData),
 }
 
-impl TryInto<ApiTrack> for Track {
+impl TryInto<TrackData> for Track {
     type Error = SoundcloudApiError;
 
-    fn try_into(self) -> Result<ApiTrack, Self::Error> {
+    fn try_into(self) -> Result<TrackData, Self::Error> {
         let Track::Full(track_data) = self else {
             return Err(SoundcloudApiError::TrackDataIsNotFull)
         };
 
-        Ok(track_data.into())
+        Ok(track_data)
     }
 }
 
@@ -44,15 +44,22 @@ pub struct StubTrackData {
     pub id: i64
 }
 
-impl Into<TrackInputSoundcloud> for TrackData {
-    fn into(self) -> TrackInputSoundcloud {
-        TrackInputSoundcloud {
-            id: self.id,
-            title: self.title,
-            duration: self.duration,
-            img: self.artwork_url,
-            author_id: self.user.id
-        }
+impl Into<(TrackInputSoundcloud, AuthorInputSoundcloud)> for TrackData {
+    fn into(self) -> (TrackInputSoundcloud, AuthorInputSoundcloud) {
+        (
+            TrackInputSoundcloud {
+                id: self.id,
+                title: self.title,
+                duration: self.duration,
+                img: self.artwork_url,
+                author_id: self.user.id.clone(),
+            },
+            AuthorInputSoundcloud {
+                id: self.user.id,
+                title: self.user.username,
+                img: self.user.avatar_url,
+            }
+        )
     }
 }
 
