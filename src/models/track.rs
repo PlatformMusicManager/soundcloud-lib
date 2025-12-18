@@ -1,9 +1,9 @@
+use crate::models::user::User;
 use domain::errors::music_services::soundcloud_api_error::SoundcloudApiError;
 use domain::models::db::soundcloud::{AuthorInputSoundcloud, TrackInputSoundcloud};
 use domain::models::music_api::services::ApiServices::Soundcloud;
 use domain::models::music_api::track::ApiTrack;
 use serde::{Deserialize, Serialize};
-use crate::models::user::User;
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(untagged)]
@@ -21,7 +21,7 @@ impl TryInto<TrackData> for Track {
 
     fn try_into(self) -> Result<TrackData, Self::Error> {
         let Track::Full(track_data) = self else {
-            return Err(SoundcloudApiError::TrackDataIsNotFull)
+            return Err(SoundcloudApiError::TrackDataIsNotFull);
         };
 
         Ok(track_data)
@@ -41,7 +41,7 @@ pub struct TrackData {
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct StubTrackData {
-    pub id: i64
+    pub id: i64,
 }
 
 impl Into<(TrackInputSoundcloud, AuthorInputSoundcloud)> for TrackData {
@@ -58,7 +58,7 @@ impl Into<(TrackInputSoundcloud, AuthorInputSoundcloud)> for TrackData {
                 id: self.user.id,
                 title: self.user.username,
                 img: self.user.avatar_url,
-            }
+            },
         )
     }
 }
@@ -69,6 +69,7 @@ impl Into<ApiTrack> for TrackData {
             id: self.id.to_string(),
             service: Soundcloud,
             title: self.title,
+            picture: self.artwork_url,
             artists: vec![self.user.into()],
             alb_id: None,
             alb_title: None,
