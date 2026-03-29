@@ -1,34 +1,36 @@
-use std::collections::HashMap;
-use async_stream::stream;
-use futures::{StreamExt, TryStreamExt};
-use regex::Regex;
-use reqwest::{Client, Request, Url};
-use serde::{Deserialize, Serialize};
-use std::sync::{Arc, LazyLock};
-use thiserror::Error;
-use std::error::Error as StdError;
-use std::iter::{Extend, IntoIterator};
-use aws_sdk_s3::Client as S3Client;
-use bytes::Bytes;
-use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
-use aws_sdk_s3::primitives::ByteStream as SdkByteStream;
-use axum::body::Body as AxumBody;
-use axum::response::{IntoResponse, Response};
-use tokio::sync::broadcast;
-use tokio::sync::broadcast::error::{SendError, RecvError};
-use log::{error, info, debug};
-use tokio_stream::wrappers::BroadcastStream;
 use crate::byte_stream::{BodyStreamError, BroadcastStreamBodyWrapper, ByteStream};
-use url::ParseError;
+use crate::models::playlist::PlaylistData;
+use crate::models::search::SearchItem;
 use crate::models::search::SearchResponse;
 use crate::models::track::{Track, TrackData};
+use crate::models::user::User;
+use async_stream::stream;
+use aws_sdk_s3::Client as S3Client;
+use aws_sdk_s3::primitives::ByteStream as SdkByteStream;
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use axum::body::Body as AxumBody;
+use axum::response::{IntoResponse, Response};
+use bytes::Bytes;
 use const_format::formatcp;
 use domain::create_json_error_str;
 use domain::errors::music_services::soundcloud_api_error::SoundcloudApiError;
+use futures::{StreamExt, TryStreamExt};
 use http_body::Body;
+use log::{debug, error, info};
+use regex::Regex;
 use reqwest::header::{HeaderMap, HeaderValue};
+use reqwest::{Client, Request, Url};
 use serde::de::DeserializeOwned;
-use crate::models::playlist::PlaylistData;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::error::Error as StdError;
+use std::iter::{Extend, IntoIterator};
+use std::sync::{Arc, LazyLock};
+use thiserror::Error;
+use tokio::sync::broadcast;
+use tokio::sync::broadcast::error::{RecvError, SendError};
+use tokio_stream::wrappers::BroadcastStream;
+use url::ParseError;
 
 const BASE_URL: &'static str = "https://api-v2.soundcloud.com";
 
@@ -52,12 +54,14 @@ impl SoundCloudApi {
         s3_client: S3Client,
         bucket_name: String,
         part_size: usize,
-    )-> Self {
+    ) -> Self {
         let mut headers = HeaderMap::new();
-        headers.insert("Host", HeaderValue::from_static("api-v2.soundcloud.com"));
-        headers.insert("User-Agent", HeaderValue::from_static(
-            "User-Agent Mozilla/5.0 (X11; Linux x86_64; rv:146.0) Gecko/20100101 Firefox/146.0"
-        ));
+        headers.insert(
+            "User-Agent",
+            HeaderValue::from_static(
+                "Mozilla/5.0 (X11; Linux x86_64; rv:146.0) Gecko/20100101 Firefox/146.0",
+            ),
+        );
 
         Self {
             s3_client,
@@ -69,25 +73,21 @@ impl SoundCloudApi {
         }
     }
 
-    async fn make_req(
-        &self,
-        url: Url
-    ) -> Result<reqwest::Response, SoundcloudApiError> {
-        let res = self.client.get(url)
-            .send()
-            .await?
-            .error_for_status()?;
+    async fn make_req(&self, url: Url) -> Result<reqwest::Response, SoundcloudApiError> {
+        let res = self.client.get(url).send().await?.error_for_status()?;
 
         Ok(res)
     }
 
     async fn make_req_deserialize<T: for<'a> Deserialize<'a>>(
         &self,
-        url: Url
+        url: Url,
     ) -> Result<T, SoundcloudApiError> {
         let req = self.client.get(url).build()?;
 
-        let res = self.client.execute(req)
+        let res = self
+            .client
+            .execute(req)
             .await?
             .error_for_status()?
             .text()
@@ -119,20 +119,69 @@ impl SoundCloudApi {
     pub async fn get_playlist(&self, id: &str) -> Result<PlaylistData, SoundcloudApiError> {
         let url = Url::parse_with_params(
             &format!("{}{}", formatcp!("{}/playlists/", BASE_URL), id),
-            &[("client_id", &self.client_id)]
+            &[("client_id", &self.client_id)],
         )?;
 
         let res = self.make_req_deserialize(url).await?;
         Ok(res)
     }
 
+    pub async fn get_user(&self, id: &str) -> Result<User, SoundcloudApiError> {
+        let url = Url::parse_with_params(
+            &format!("{}{}", formatcp!("{}/users/", BASE_URL), id),
+            &[("client_id", self.client_id.as_str())],
+        )?;
+
+        let res = self.make_req_deserialize(url).await?;
+        Ok(res)
+    }
+
+    pub async fn get_user_tracks(&self, id: &str) -> Result<Vec<Track>, SoundcloudApiError> {
+        let url = Url::parse_with_params(
+            &format!("{}/users/{}/tracks", BASE_URL, id),
+            &[("client_id", self.client_id.as_str()), ("limit", "50")],
+        )?;
+
+        let res: SearchResponse = self.make_req_deserialize(url).await?;
+
+        let tracks: Vec<Track> = res
+            .collection
+            .into_iter()
+            .filter_map(|item| match item {
+                SearchItem::Track(track) => Some(track),
+                _ => None,
+            })
+            .collect();
+
+        Ok(tracks)
+    }
+
+    pub async fn get_user_playlists(
+        &self,
+        id: &str,
+    ) -> Result<Vec<PlaylistData>, SoundcloudApiError> {
+        let url = Url::parse_with_params(
+            &format!("{}/users/{}/playlists", BASE_URL, id),
+            &[("client_id", self.client_id.as_str()), ("limit", "50")],
+        )?;
+
+        let res: SearchResponse = self.make_req_deserialize(url).await?;
+
+        let playlists: Vec<PlaylistData> = res
+            .collection
+            .into_iter()
+            .filter_map(|item| match item {
+                SearchItem::Playlist(playlist) => Some(playlist),
+                _ => None,
+            })
+            .collect();
+
+        Ok(playlists)
+    }
+
     pub async fn get_track_data(&self, id: &str) -> Result<Track, SoundcloudApiError> {
         let url = Url::parse_with_params(
-                &format!(
-                    "{}{}",
-                    formatcp!("{}/tracks/", BASE_URL),
-                    id
-                ),
+            &format!("{}{}", formatcp!("{}/tracks/", BASE_URL), id),
             &[("client_id", &self.client_id)],
         )?;
 
@@ -168,9 +217,7 @@ impl SoundCloudApi {
     }
 
     pub async fn get_chunks(&self, url: &str) -> Result<Vec<String>, SoundcloudApiError> {
-        let res: String = self.make_req_deserialize(
-            Url::parse(url)?
-        ).await?;
+        let res = self.make_req(Url::parse(url)?).await?.text().await?;
 
         let urls: Vec<String> = self
             .url_re
@@ -185,7 +232,7 @@ impl SoundCloudApi {
         let track_data = self.get_track_data(id).await?;
 
         let Track::Full(track) = track_data else {
-            return Err(SoundcloudApiError::TrackDataIsNotFull)
+            return Err(SoundcloudApiError::TrackDataIsNotFull);
         };
 
         // Picking first available audio, first one is always highest quality
@@ -204,9 +251,7 @@ impl SoundCloudApi {
     }
 
     async fn stream_chunk(&self, url: &str) -> Result<ByteStream, SoundcloudApiError> {
-        let response = self.make_req(
-            Url::parse(&url)?
-        ).await?;
+        let response = self.make_req(Url::parse(&url)?).await?;
 
         let stream = response
             .bytes_stream()
@@ -216,31 +261,33 @@ impl SoundCloudApi {
         Ok(stream)
     }
 
-
     pub async fn stream(
         self: Arc<Self>,
         id: String,
         save: bool,
         track_url: Option<String>,
-        track_token: Option<String>
+        track_token: Option<String>,
     ) -> Result<AxumBody, SoundcloudApiError> {
         let url_chunks = match (track_url, track_token) {
             (Some(track_url), Some(track_token)) => {
                 let url_with_chunks = self.get_url_to_chunks(&track_url, &track_token).await?;
                 self.get_chunks(&url_with_chunks).await?
             }
-            _ => self.get_chunks_by_id(&id).await?
+            _ => self.get_chunks_by_id(&id).await?,
         };
 
         let body = match save {
             true => AxumBody::new(self.stream_and_save(id, url_chunks).await?),
-            false => AxumBody::from_stream(self.stream_chunks(url_chunks).await?)
+            false => AxumBody::from_stream(self.stream_chunks(url_chunks).await?),
         };
 
         Ok(body)
     }
 
-    async fn stream_chunks(self: Arc<Self>, url_chunks: Vec<String>) -> Result<ByteStream, SoundcloudApiError> {
+    async fn stream_chunks(
+        self: Arc<Self>,
+        url_chunks: Vec<String>,
+    ) -> Result<ByteStream, SoundcloudApiError> {
         let stream = stream! {
             // Iterate through each of your chunk URLs
             for url_chunk in url_chunks.into_iter() {
@@ -276,7 +323,10 @@ impl SoundCloudApi {
         url_chunks: Vec<String>,
     ) -> Result<BroadcastStreamBodyWrapper, SoundcloudApiError> {
         // 2. Create the broadcast channel
-        let (tx, _): (broadcast::Sender<Result<Bytes, BodyStreamError>>, broadcast::Receiver<Result<Bytes, BodyStreamError>>) = broadcast::channel(1024);
+        let (tx, _): (
+            broadcast::Sender<Result<Bytes, BodyStreamError>>,
+            broadcast::Receiver<Result<Bytes, BodyStreamError>>,
+        ) = broadcast::channel(1024);
 
         // --- S3 Uploader Setup ---
         let mut s3_rx = tx.subscribe();
@@ -306,8 +356,13 @@ impl SoundCloudApi {
                                 if upload_id.is_none() {
                                     if buffer.len() >= threshold {
                                         // Start multipart upload
-                                        info!("Buffer reached {} bytes. Starting multipart upload for id: {}", buffer.len(), s3_id);
-                                        let create_res = self_for_s3.s3_client
+                                        info!(
+                                            "Buffer reached {} bytes. Starting multipart upload for id: {}",
+                                            buffer.len(),
+                                            s3_id
+                                        );
+                                        let create_res = self_for_s3
+                                            .s3_client
                                             .create_multipart_upload()
                                             .bucket(&self_for_s3.bucket_name)
                                             .key(&s3_id)
@@ -319,7 +374,10 @@ impl SoundCloudApi {
                                                 upload_id = output.upload_id;
                                             }
                                             Err(e) => {
-                                                error!("Failed to create multipart upload for id: {}. Error: {:?}", s3_id, e);
+                                                error!(
+                                                    "Failed to create multipart upload for id: {}. Error: {:?}",
+                                                    s3_id, e
+                                                );
                                                 return;
                                             }
                                         }
@@ -334,7 +392,8 @@ impl SoundCloudApi {
                                         let part_data = buffer.clone();
                                         buffer.clear();
 
-                                        let part_res = self_for_s3.s3_client
+                                        let part_res = self_for_s3
+                                            .s3_client
                                             .upload_part()
                                             .bucket(&self_for_s3.bucket_name)
                                             .key(&s3_id)
@@ -346,16 +405,22 @@ impl SoundCloudApi {
 
                                         match part_res {
                                             Ok(output) => {
-                                                parts.push(CompletedPart::builder()
-                                                    .part_number(part_number)
-                                                    .set_e_tag(output.e_tag)
-                                                    .build());
+                                                parts.push(
+                                                    CompletedPart::builder()
+                                                        .part_number(part_number)
+                                                        .set_e_tag(output.e_tag)
+                                                        .build(),
+                                                );
                                                 part_number += 1;
                                             }
                                             Err(e) => {
-                                                error!("Failed to upload part {} for id: {}. Error: {:?}", part_number, s3_id, e);
+                                                error!(
+                                                    "Failed to upload part {} for id: {}. Error: {:?}",
+                                                    part_number, s3_id, e
+                                                );
                                                 // Abort multipart
-                                                let _ = self_for_s3.s3_client
+                                                let _ = self_for_s3
+                                                    .s3_client
                                                     .abort_multipart_upload()
                                                     .bucket(&self_for_s3.bucket_name)
                                                     .key(&s3_id)
@@ -371,7 +436,8 @@ impl SoundCloudApi {
                             Err(e) => {
                                 error!("Stream error received for id: {}: {:?}", s3_id, e);
                                 if let Some(uid) = upload_id {
-                                     let _ = self_for_s3.s3_client
+                                    let _ = self_for_s3
+                                        .s3_client
                                         .abort_multipart_upload()
                                         .bucket(&self_for_s3.bucket_name)
                                         .key(&s3_id)
@@ -388,9 +454,13 @@ impl SoundCloudApi {
                         break;
                     }
                     Err(RecvError::Lagged(skipped)) => {
-                        error!("Stream lagged for id: {}, skipped {} messages", s3_id, skipped);
+                        error!(
+                            "Stream lagged for id: {}, skipped {} messages",
+                            s3_id, skipped
+                        );
                         if let Some(uid) = upload_id {
-                             let _ = self_for_s3.s3_client
+                            let _ = self_for_s3
+                                .s3_client
                                 .abort_multipart_upload()
                                 .bucket(&self_for_s3.bucket_name)
                                 .key(&s3_id)
@@ -407,7 +477,8 @@ impl SoundCloudApi {
             if let Some(uid) = upload_id {
                 // Upload remaining buffer as last part if not empty
                 if !buffer.is_empty() {
-                    let part_res = self_for_s3.s3_client
+                    let part_res = self_for_s3
+                        .s3_client
                         .upload_part()
                         .bucket(&self_for_s3.bucket_name)
                         .key(&s3_id)
@@ -419,14 +490,20 @@ impl SoundCloudApi {
 
                     match part_res {
                         Ok(output) => {
-                             parts.push(CompletedPart::builder()
-                                .part_number(part_number)
-                                .set_e_tag(output.e_tag)
-                                .build());
+                            parts.push(
+                                CompletedPart::builder()
+                                    .part_number(part_number)
+                                    .set_e_tag(output.e_tag)
+                                    .build(),
+                            );
                         }
                         Err(e) => {
-                            error!("Failed to upload last part for id: {}. Error: {:?}", s3_id, e);
-                            let _ = self_for_s3.s3_client
+                            error!(
+                                "Failed to upload last part for id: {}. Error: {:?}",
+                                s3_id, e
+                            );
+                            let _ = self_for_s3
+                                .s3_client
                                 .abort_multipart_upload()
                                 .bucket(&self_for_s3.bucket_name)
                                 .key(&s3_id)
@@ -443,7 +520,8 @@ impl SoundCloudApi {
                     .set_parts(Some(parts))
                     .build();
 
-                let complete_res = self_for_s3.s3_client
+                let complete_res = self_for_s3
+                    .s3_client
                     .complete_multipart_upload()
                     .bucket(&self_for_s3.bucket_name)
                     .key(&s3_id)
@@ -454,13 +532,20 @@ impl SoundCloudApi {
 
                 match complete_res {
                     Ok(_) => info!("Successfully completed multipart upload for id: {}", s3_id),
-                    Err(e) => error!("Failed to complete multipart upload for id: {}. Error: {:?}", s3_id, e),
+                    Err(e) => error!(
+                        "Failed to complete multipart upload for id: {}. Error: {:?}",
+                        s3_id, e
+                    ),
                 }
-
             } else {
                 // Single put
-                info!("Uploading single object for id: {} (size: {} bytes)", s3_id, buffer.len());
-                let result = self_for_s3.s3_client
+                info!(
+                    "Uploading single object for id: {} (size: {} bytes)",
+                    s3_id,
+                    buffer.len()
+                );
+                let result = self_for_s3
+                    .s3_client
                     .put_object()
                     .bucket(&self_for_s3.bucket_name)
                     .key(&s3_id)
@@ -469,9 +554,12 @@ impl SoundCloudApi {
                     .await;
 
                 if let Err(e) = result {
-                    error!("Failed to upload single object with id: {}. Error: {:?}", s3_id, e);
-                     if let Some(source) = e.source() {
-                         error!("Caused by: {:?}", source);
+                    error!(
+                        "Failed to upload single object with id: {}. Error: {:?}",
+                        s3_id, e
+                    );
+                    if let Some(source) = e.source() {
+                        error!("Caused by: {:?}", source);
                     }
                 } else {
                     info!("Successfully uploaded single object with id: {}", s3_id);

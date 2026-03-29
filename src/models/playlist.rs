@@ -1,9 +1,12 @@
-use domain::models::db::soundcloud::{AuthorInputSoundcloud, CreateReplacePlaylistInput, PlaylistInputSoundcloud, TrackInputSoundcloud};
+use crate::models::track::{Track, TrackData};
+use crate::models::user::User;
+use domain::models::db::soundcloud::{
+    AuthorInputSoundcloud, CreateReplacePlaylistInput, PlaylistInputSoundcloud,
+    TrackInputSoundcloud,
+};
 use domain::models::music_api::playlist::ApiPlaylist;
 use domain::models::music_api::track::ApiTrack;
 use serde::{Deserialize, Serialize};
-use crate::models::track::{Track, TrackData};
-use crate::models::user::User;
 
 // #[derive(Deserialize, Serialize, Clone)]
 // #[serde(untagged)] // Try to deserialize as one of the variants
@@ -23,7 +26,7 @@ pub struct PlaylistData {
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
-pub struct TracksList (pub Vec<Track>);
+pub struct TracksList(pub Vec<Track>);
 
 impl Into<(Vec<TrackInputSoundcloud>, Vec<AuthorInputSoundcloud>)> for TracksList {
     fn into(self) -> (Vec<TrackInputSoundcloud>, Vec<AuthorInputSoundcloud>) {
@@ -43,7 +46,6 @@ impl Into<(Vec<TrackInputSoundcloud>, Vec<AuthorInputSoundcloud>)> for TracksLis
         (tracks, authors)
     }
 }
-
 
 impl Into<CreateReplacePlaylistInput> for PlaylistData {
     fn into(self) -> CreateReplacePlaylistInput {
@@ -67,6 +69,7 @@ impl Into<CreateReplacePlaylistInput> for PlaylistData {
 impl Into<ApiPlaylist> for PlaylistData {
     fn into(self) -> ApiPlaylist {
         ApiPlaylist {
+            platform: domain::models::music_api::services::ApiServices::Soundcloud,
             id: self.id.to_string(),
             title: self.title,
             parent_user_id: self.user.id.to_string(),
@@ -74,14 +77,15 @@ impl Into<ApiPlaylist> for PlaylistData {
             parent_picture: self.user.avatar_url,
             picture: self.artwork_url,
             size: self.tracks.0.len() as u32,
-            tracks: self.tracks.0.into_iter()
-                .filter_map(|el| {
-                    match el {
-                        Track::Full(data) => Some(data.into()),
-                        Track::Stub(_) => None,
-                    }
+            tracks: self
+                .tracks
+                .0
+                .into_iter()
+                .filter_map(|el| match el {
+                    Track::Full(data) => Some(data.into()),
+                    Track::Stub(_) => None,
                 })
-                .collect()
+                .collect(),
         }
     }
 }

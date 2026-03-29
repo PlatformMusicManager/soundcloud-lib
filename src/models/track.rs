@@ -76,6 +76,7 @@ impl Into<ApiTrack> for TrackData {
             duration: self.duration,
             track_url: self.media.get_best_media().map(|media| media.url.clone()),
             track_token: Some(self.track_authorization),
+            platform: Soundcloud,
         }
     }
 }
