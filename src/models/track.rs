@@ -50,7 +50,7 @@ impl Into<(TrackInputSoundcloud, AuthorInputSoundcloud)> for TrackData {
             TrackInputSoundcloud {
                 id: self.id,
                 title: self.title,
-                duration: self.duration,
+                duration: self.duration / 1000,
                 img: self.artwork_url,
                 author_id: self.user.id.clone(),
             },
@@ -73,7 +73,7 @@ impl Into<ApiTrack> for TrackData {
             artists: vec![self.user.into()],
             alb_id: None,
             alb_title: None,
-            duration: self.duration,
+            duration: self.duration / 1000,
             track_url: self.media.get_best_media().map(|media| media.url.clone()),
             track_token: Some(self.track_authorization),
             platform: Soundcloud,
